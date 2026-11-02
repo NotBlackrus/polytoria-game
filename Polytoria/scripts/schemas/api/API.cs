@@ -69,6 +69,8 @@ public struct APIUserThumbnail
 
 public struct APIAvatarResponse
 {
+	[JsonPropertyName("id")]
+	public string? ID { get; set; }
 	[JsonPropertyName("colors")]
 	public APIAvatarBodyColors Colors { get; set; }
 	[JsonPropertyName("assets")]

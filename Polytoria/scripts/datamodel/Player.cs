@@ -53,6 +53,7 @@ public sealed partial class Player : NPC
 	private int _userID;
 	private bool _useBubbleChat = true;
 	private bool _autoLoadAppearance = true;
+	private bool _appearanceFetchedOnce = false;
 	private bool _allowAnimationWhileMoving = false;
 	private PlayerMovementModeEnum _movementMode = PlayerMovementModeEnum.Default;
 	private PlayerRotationModeEnum _rotationMode = PlayerRotationModeEnum.Automatic;
@@ -1155,17 +1156,17 @@ public sealed partial class Player : NPC
 	[ScriptMethod]
 	public void ResetAppearance()
 	{
-		ClearAppearance();
 		if (AutoLoadAppearance)
 		{
-			if (Root.Entry != null && Root.Entry.IsSoloTest)
-			{
-				LoadAppearance(1144);
-			}
-			else
-			{
-				LoadAppearance(UserID);
-			}
+			bool isFirst = !_appearanceFetchedOnce;
+			_appearanceFetchedOnce = true;
+			int id = (Root.Entry != null && Root.Entry.IsSoloTest) ? 1144 : UserID;
+			// First spawn forces fresh fetch; subsequent respawns conditionally revalidate via ETag
+			LoadAppearanceInternal(id, forceRefresh: isFirst, revalidate: !isFirst);
+		}
+		else
+		{
+			ClearAppearance();
 		}
 	}
 

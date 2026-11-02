@@ -472,6 +472,7 @@ public sealed partial class NetworkService : Instance
 
 	private void OnPlayerRemoved(Player player)
 	{
+		AvatarOutfitCache.Invalidate(player.UserID);
 		if (IsProd)
 		{
 			Dictionary<string, string> data = new()

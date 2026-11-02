@@ -63,6 +63,42 @@ public static class PolyAPI
 		);
 	}
 
+	public static async Task<AvatarFetchResult> GetUserAvatarConditionalAsync(int userID, string? etag = null)
+	{
+		using HttpRequestMessage msg = new(HttpMethod.Get, Globals.ApiEndpoint.PathJoin("/v1/users/" + userID.ToString() + "/avatar"));
+		msg.Headers.TryAddWithoutValidation("Accept", "application/json");
+
+		if (!string.IsNullOrEmpty(etag))
+		{
+			string formattedEtag = etag.StartsWith('"') ? etag : $"\"{etag}\"";
+			msg.Headers.TryAddWithoutValidation("If-None-Match", formattedEtag);
+		}
+
+		using HttpResponseMessage response = await _client.SendAsync(msg);
+
+		if (response.StatusCode == System.Net.HttpStatusCode.NotModified)
+		{
+			return AvatarFetchResult.Unchanged();
+		}
+
+		response.EnsureSuccessStatusCode();
+
+		string json = await response.Content.ReadAsStringAsync();
+		APIAvatarResponse? result = System.Text.Json.JsonSerializer.Deserialize(json, APIGenerationContext.Default.APIAvatarResponse);
+		if (result == null)
+		{
+			throw new HttpRequestException("Failed to deserialize avatar response: returned null");
+		}
+
+		APIAvatarResponse avatar = result.Value;
+		if (string.IsNullOrEmpty(avatar.ID) && response.Headers.ETag != null)
+		{
+			avatar.ID = response.Headers.ETag.Tag?.Trim('"');
+		}
+
+		return AvatarFetchResult.Modified(avatar);
+	}
+
 	public static Task<APIPlaceInfo> GetWorldFromID(int placeID)
 	{
 		return _client.GetFromJsonAsync(

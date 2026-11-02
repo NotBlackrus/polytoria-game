@@ -97,6 +97,10 @@ public partial class AssetLoader : Node
 		// Return cached asset
 		if (_cache.TryGetValue(key, out CacheItem cached))
 		{
+			if (item.Type == ResourceType.Mesh)
+			{
+				PT.Print($"Loaded mesh {item.ID} from memory cache");
+			}
 			Callable.From(() => callback(cached)).CallDeferred();
 			return;
 		}
@@ -117,6 +121,25 @@ public partial class AssetLoader : Node
 		{
 			Callable.From(() => PT.PrintErr("Failed to load resource (Type: " + item.Type + ", ID: " + item.ID + "): " + exception.Message)).CallDeferred();
 		}
+	}
+
+	public void InvalidateCache(ResourceType type, uint id)
+	{
+		AssetCacheKey key = new(type, id, null);
+		if (_cache.TryRemove(key, out CacheItem removed))
+		{
+			Interlocked.Add(ref _assetSizeBytes, -removed.SizeBytes);
+		}
+
+		if (type == ResourceType.Mesh)
+		{
+			PTAssetProvider.InvalidateMeshCache(id);
+		}
+	}
+
+	public void ClearDiskCache()
+	{
+		PTAssetProvider.ClearMeshCache();
 	}
 }
 

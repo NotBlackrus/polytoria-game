@@ -72,6 +72,7 @@ public sealed partial class PolytorianModel : CharacterModel
 	private static StringName? _timeScaleParamName;
 	private int _toBeLoadedCount = 0;
 	private bool _faceLoaded = false;
+	private bool _bodyLoaded = false;
 	private float _lastLookBlendX = 0;
 	private float _lastLookBlendY = 0;
 	private bool _faceOverrided = false;
@@ -218,6 +219,7 @@ public sealed partial class PolytorianModel : CharacterModel
 			_bodyMesh = value;
 			if (_bodyMesh != null)
 			{
+				_bodyLoaded = false;
 				AddLoadCount();
 				_bodyOverrided = true;
 				_bodyMesh.LinkTo(this);
@@ -527,10 +529,17 @@ public sealed partial class PolytorianModel : CharacterModel
 			ApplyBodyPart(n, TorsoMeshInstance, "Torso");
 
 			n.QueueFree();
+
+			if (!_bodyLoaded)
+			{
+				_bodyLoaded = true;
+				AssetLoadCheckout();
+			}
 		}
 		else if (resource == null)
 		{
 			_bodyPkScene = null;
+			_bodyLoaded = false;
 			ApplyDefaultBodyPart(HeadMeshInstance, "Head");
 			ApplyDefaultBodyPart(LeftArmMeshInstance, "LeftArm");
 			ApplyDefaultBodyPart(RightArmMeshInstance, "RightArm");
@@ -720,13 +729,38 @@ public sealed partial class PolytorianModel : CharacterModel
 	[ScriptMethod]
 	public void LoadAppearance(int userID, bool loadTool = true)
 	{
+		LoadAppearanceInternal(userID, loadTool, forceRefresh: false, revalidate: false);
+	}
+
+	internal void LoadAppearanceInternal(int userID, bool loadTool = true, bool forceRefresh = false, bool revalidate = false)
+	{
 		ClearAppearance();
-		_ = InternalLoadAppearance(userID, loadTool);
+		ObserveLoad(InternalLoadAppearance(userID, loadTool: loadTool, forceRefresh: forceRefresh, revalidate: revalidate));
+	}
+
+	private static async void ObserveLoad(Task task)
+	{
+		try
+		{
+			await task;
+		}
+		catch (OperationCanceledException)
+		{
+			// Load was replaced or model was deleted; expected
+		}
+		catch (Exception ex)
+		{
+			PT.PrintErr($"Failed to load appearance: {ex.Message}");
+		}
 	}
 
 	[ScriptMethod]
 	public void ClearAppearance()
 	{
+		_toBeLoadedCount = 0;
+		_faceLoaded = false;
+		_bodyLoaded = false;
+
 		HeadColor = _defaultBodyColor;
 		TorsoColor = _defaultBodyColor;
 		LeftArmColor = _defaultBodyColor;
@@ -754,14 +788,16 @@ public sealed partial class PolytorianModel : CharacterModel
 
 	private static Color MatGetAlbedo(ShaderMaterial mat) => (Color)mat.GetShaderParameter(_albedoParam);
 
-	internal async Task<AvatarLoadResponse> InternalLoadAppearance(int userID, bool loadTool = false, bool loadToolNpc = false)
+	internal async Task<AvatarLoadResponse> InternalLoadAppearance(int userID, bool loadTool = false, bool loadToolNpc = false, bool forceRefresh = false, bool revalidate = false)
 	{
 		_loadAppearanceCount++;
 
 		// Prevent reloading
 		int myCount = _loadAppearanceCount;
 
-		APIAvatarResponse avatarData = await PolyAPI.GetUserAvatarFromID(userID);
+		AddLoadCount();
+
+		APIAvatarResponse avatarData = await AvatarOutfitCache.GetAsync(userID, forceRefresh, revalidate);
 		if (myCount != _loadAppearanceCount) throw new OperationCanceledException("The avatar is cancelled");
 
 		if (IsDeleted)

@@ -7,6 +7,7 @@ using Humanizer;
 using Polytoria.Client.Settings;
 using Polytoria.Datamodel;
 using Polytoria.Shared.AssetLoaders;
+using Polytoria.Utils;
 using System;
 using System.Collections.Generic;
 
@@ -60,6 +61,7 @@ public partial class NerdStatPanel : Control
 		CreateLabel("Asset Memory", () => AssetLoader.Singleton.AssetSizeBytes.Bytes().Megabytes.ToString("0.##") + " mb");
 		CreateLabel("Loaded Assets", () => AssetLoader.Singleton.AssetCacheCount.ToString());
 		CreateLabel("Pending Assets", () => AssetLoader.Singleton.PendingAssetsCount.ToString());
+		CreateLabel("Outfit Cache", () => $"{AvatarOutfitCache.Count} ({AvatarOutfitCache.Hits}h/{AvatarOutfitCache.Misses}m)");
 		CreateDivider();
 		CreateLabel("Data Send", () =>
 		{

@@ -1150,6 +1150,14 @@ public partial class NPC : Physical
 		}
 	}
 
+	internal void LoadAppearanceInternal(int userID, bool forceRefresh = false, bool revalidate = false)
+	{
+		if (Character is PolytorianModel ptm)
+		{
+			ptm.LoadAppearanceInternal(userID, Root.PlayerDefaults.LoadAppearanceTools, forceRefresh, revalidate);
+		}
+	}
+
 	[ScriptMethod]
 	public void ClearAppearance()
 	{

@@ -20,6 +20,7 @@ public class PTAssetProvider : IAssetProvider
 	private const string ServeURL = RootUrl + "serve/";
 	private const string ServeMeshURL = RootUrl + "serve-mesh/";
 	private const string ServeAudioURL = RootUrl + "serve-audio/";
+	private const string MeshCacheDir = "user://cache/meshes/v1/";
 	private readonly PTHttpClient _client = new();
 
 	public async Task<CacheItem> LoadResource(CacheItem item)
@@ -27,6 +28,11 @@ public class PTAssetProvider : IAssetProvider
 #if CREATOR
 		_client.DefaultRequestHeaders["Authorization"] = PolyCreatorAPI.Token;
 #endif
+
+		if (item.Type == ResourceType.Mesh && TryLoadMeshFromCache(item.ID, out CacheItem cachedMesh))
+		{
+			return cachedMesh;
+		}
 
 		string url = GetAssetServeURL(item.ID, item.Type);
 		ServeResponse response = await _client.GetFromJsonAsync(url, ServeResponseGenerationContext.Default.ServeResponse);
@@ -132,7 +138,123 @@ public class PTAssetProvider : IAssetProvider
 
 		item.Resource = await callback.Task;
 
+		SaveMeshToCache(item.ID, (PackedScene)item.Resource);
+
 		return item;
+	}
+
+	private static string GetMeshCachePath(uint id) => $"{MeshCacheDir}{id}.scn";
+
+	private static bool TryLoadMeshFromCache(uint id, out CacheItem item)
+	{
+		item = default;
+		if (id == 0) return false;
+
+		string path = GetMeshCachePath(id);
+		if (!FileAccess.FileExists(path))
+		{
+			return false;
+		}
+
+		try
+		{
+			PackedScene? scene = ResourceLoader.Load<PackedScene>(path, cacheMode: ResourceLoader.CacheMode.Ignore);
+			if (scene != null)
+			{
+				long size = 0;
+				using (FileAccess? file = FileAccess.Open(path, FileAccess.ModeFlags.Read))
+				{
+					if (file != null)
+					{
+						size = (long)file.GetLength();
+					}
+				}
+
+				item = new CacheItem
+				{
+					Type = ResourceType.Mesh,
+					ID = id,
+					Resource = scene,
+					SizeBytes = size
+				};
+
+				PT.Print($"Loaded mesh {id} from disk cache ({path})");
+				return true;
+			}
+		}
+		catch (Exception ex)
+		{
+			PT.PrintErr($"Failed to load cached mesh for {id}, deleting corrupt cache: {ex.Message}");
+			try
+			{
+				DirAccess.RemoveAbsolute(path);
+			}
+			catch { }
+		}
+
+		return false;
+	}
+
+	private static void SaveMeshToCache(uint id, PackedScene scene)
+	{
+		if (id == 0) return;
+
+		try
+		{
+			if (!DirAccess.DirExistsAbsolute(MeshCacheDir))
+			{
+				DirAccess.MakeDirRecursiveAbsolute(MeshCacheDir);
+			}
+
+			string path = GetMeshCachePath(id);
+			Error err = ResourceSaver.Save(scene, path, ResourceSaver.SaverFlags.Compress);
+			if (err != Error.Ok)
+			{
+				PT.PrintErr($"Failed to save mesh to cache: {err} ({path})");
+			}
+		}
+		catch (Exception ex)
+		{
+			PT.PrintErr($"Failed to save mesh cache for {id}: {ex.Message}");
+		}
+	}
+
+	public static void InvalidateMeshCache(uint id)
+	{
+		try
+		{
+			string path = GetMeshCachePath(id);
+			if (FileAccess.FileExists(path))
+			{
+				DirAccess.RemoveAbsolute(path);
+			}
+		}
+		catch (Exception ex)
+		{
+			PT.PrintErr($"Failed to invalidate mesh cache for {id}: {ex.Message}");
+		}
+	}
+
+	public static void ClearMeshCache()
+	{
+		try
+		{
+			if (DirAccess.DirExistsAbsolute(MeshCacheDir))
+			{
+				using DirAccess? dir = DirAccess.Open(MeshCacheDir);
+				if (dir != null)
+				{
+					foreach (string file in dir.GetFiles())
+					{
+						dir.Remove(file);
+					}
+				}
+			}
+		}
+		catch (Exception ex)
+		{
+			PT.PrintErr($"Failed to clear mesh cache: {ex.Message}");
+		}
 	}
 
 	private static Image DecodeImage(byte[] buffer, Vector2I? resize)
