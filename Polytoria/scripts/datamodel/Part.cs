@@ -6,6 +6,7 @@ using Godot;
 using Polytoria.Attributes;
 using Polytoria.Shared;
 using System;
+using System.Threading;
 
 namespace Polytoria.Datamodel;
 
@@ -17,6 +18,12 @@ public partial class Part : Entity
 	private PartMaterialEnum _material;
 	private Color _color = new(1, 1, 1);
 	private bool _castShadows;
+	private OccluderInstance3D? _occluderInstance;
+	private BoxOccluder3D? _boxOccluder;
+	private OcclusionModeEnum _occlusionMode = OcclusionModeEnum.Auto;
+
+	private static int _activeOccluderCount = 0;
+	public static int ActiveOccluderCount => Math.Max(0, _activeOccluderCount);
 
 	private Node3D _nRemoteAt = null!; // Remote collider proxy
 
@@ -28,8 +35,14 @@ public partial class Part : Entity
 	public override void EnterTree()
 	{
 		Root?.Bridge?.MarkDirty(this);
-
 		base.EnterTree();
+		UpdateOccluder();
+	}
+
+	public override void ExitTree()
+	{
+		RemoveOccluder();
+		base.ExitTree();
 	}
 
 	public override void Init()
@@ -54,6 +67,7 @@ public partial class Part : Entity
 
 	public override void PreDelete()
 	{
+		RemoveOccluder();
 		RemoveCollisionShape(_collider);
 		base.PreDelete();
 	}
@@ -63,6 +77,7 @@ public partial class Part : Entity
 		UpdateMeshSize();
 		UpdateShape();
 		UpdateCollision();
+		UpdateOccluder();
 
 		base.Ready();
 	}
@@ -70,6 +85,7 @@ public partial class Part : Entity
 	internal override void OnNodeSizeChanged(Vector3 newSize)
 	{
 		UpdateMeshSize();
+		UpdateOccluder();
 		ShapeChanged?.Invoke();
 		base.OnNodeSizeChanged(newSize);
 	}
@@ -98,7 +114,40 @@ public partial class Part : Entity
 
 			ShapeChanged?.Invoke();
 			UpdateShape();
+			UpdateOccluder();
 			OnPropertyChanged();
+		}
+	}
+
+	[Editable, ScriptProperty, DefaultValue(OcclusionModeEnum.Auto)]
+	public OcclusionModeEnum OcclusionMode
+	{
+		get => _occlusionMode;
+		set
+		{
+			if (_occlusionMode == value)
+			{
+				return;
+			}
+
+			_occlusionMode = value;
+			UpdateOccluder();
+			OnPropertyChanged();
+		}
+	}
+
+	[Editable, ScriptProperty]
+	public override bool Anchored
+	{
+		get => base.Anchored;
+		set
+		{
+			bool changed = base.Anchored != value;
+			base.Anchored = value;
+			if (changed)
+			{
+				UpdateOccluder();
+			}
 		}
 	}
 
@@ -130,12 +179,23 @@ public partial class Part : Entity
 				return;
 			}
 
+			bool alphaChanged = Math.Abs(_color.A - value.A) > 0.001f;
 			_color = value;
 			//GD.PushWarning("Set color: ", _color);
 
 			UpdateCamLayer();
+			if (alphaChanged)
+			{
+				UpdateOccluder();
+			}
 			OnPropertyChanged();
 		}
+	}
+
+	public override void HiddenChanged(bool to)
+	{
+		base.HiddenChanged(to);
+		UpdateOccluder();
 	}
 
 	[Editable, ScriptProperty, DefaultValue(true)]
@@ -251,6 +311,81 @@ public partial class Part : Entity
 				Vector3 worldExtents = rot.X.Abs() * he.X + rot.Y.Abs() * he.Y + rot.Z.Abs() * he.Z;
 				return new(center - worldExtents, worldExtents * 2);
 		}
+	}
+
+	private bool ShouldGenerateOccluder()
+	{
+		if (Globals.IsHeadless) return false;
+		if (IsHidden || IsDeleted) return false;
+		if (OcclusionMode == OcclusionModeEnum.Disabled) return false;
+		if (OcclusionMode == OcclusionModeEnum.Enabled)
+		{
+			return Anchored && Shape == ShapeEnum.Brick;
+		}
+
+		// Auto heuristic (Roblox-style)
+		if (!Anchored) return false;
+		if (Color.A < 1f || Shape != ShapeEnum.Brick) return false;
+
+		// Surface area and thickness check
+		Vector3 s = NodeSize;
+		float maxFaceArea = Mathf.Max(s.X * s.Y, Mathf.Max(s.X * s.Z, s.Y * s.Z));
+		float minDimension = Mathf.Min(s.X, Mathf.Min(s.Y, s.Z));
+
+		return maxFaceArea >= 16.0f && minDimension >= 0.25f;
+	}
+
+	private void UpdateOccluder()
+	{
+		if (Globals.IsHeadless || !IsInsideTree())
+		{
+			RemoveOccluder();
+			return;
+		}
+
+		bool shouldOcclude = ShouldGenerateOccluder();
+
+		if (shouldOcclude)
+		{
+			if (_occluderInstance == null)
+			{
+				_boxOccluder = new BoxOccluder3D();
+				_occluderInstance = new OccluderInstance3D
+				{
+					Occluder = _boxOccluder
+				};
+				GDNode3D.AddChild(_occluderInstance, false, Node.InternalMode.Back);
+				Interlocked.Increment(ref _activeOccluderCount);
+			}
+
+			_boxOccluder!.Size = NodeSize;
+		}
+		else
+		{
+			RemoveOccluder();
+		}
+	}
+
+	private void RemoveOccluder()
+	{
+		if (_occluderInstance != null)
+		{
+			if (Node.IsInstanceValid(_occluderInstance))
+			{
+				_occluderInstance.QueueFree();
+			}
+			_occluderInstance = null;
+			_boxOccluder = null;
+			Interlocked.Decrement(ref _activeOccluderCount);
+		}
+	}
+
+	[ScriptEnum("PartOcclusionMode")]
+	public enum OcclusionModeEnum
+	{
+		Auto = 0,
+		Enabled = 1,
+		Disabled = 2
 	}
 
 	[ScriptEnum("PartShape")]

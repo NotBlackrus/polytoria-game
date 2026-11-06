@@ -14,11 +14,16 @@ public static class Node3DExtension
 {
 	public static Aabb CalculateBounds(this Node3D parent, bool excludeTopLevelTransform = true)
 	{
+		if (parent is VisibleOnScreenNotifier3D || parent is OccluderInstance3D)
+		{
+			return new();
+		}
+
 		Aabb bounds = parent is VisualInstance3D vi ? vi.GetAabb() : new();
 
 		foreach (Node child in parent.GetChildren())
 		{
-			if (child is not Node3D child3D)
+			if (child is not Node3D child3D || child3D is VisibleOnScreenNotifier3D || child3D is OccluderInstance3D)
 			{
 				continue;
 			}

@@ -57,6 +57,13 @@ public partial class NerdStatPanel : Control
 		});
 		CreateDivider();
 		CreateLabel("Non-DMB Parts", () => _root.Bridge.SeparatedPartCount.ToString());
+		CreateLabel("Active Occluders", () => Part.ActiveOccluderCount.ToString());
+		CreateLabel("Active Animations", () =>
+		{
+			int activeTotal = PolytorianModel.ActiveCount + Polytoria.Datamodel.Mesh.ActiveAnimationCount;
+			int total = PolytorianModel.TotalCount + Polytoria.Datamodel.Mesh.TotalAnimatedMeshCount;
+			return $"{activeTotal}/{total} ({PolytorianModel.ActiveCount} char, {Polytoria.Datamodel.Mesh.ActiveAnimationCount} mesh)";
+		});
 		CreateDivider();
 		CreateLabel("Asset Memory", () => AssetLoader.Singleton.AssetSizeBytes.Bytes().Megabytes.ToString("0.##") + " mb");
 		CreateLabel("Loaded Assets", () => AssetLoader.Singleton.AssetCacheCount.ToString());

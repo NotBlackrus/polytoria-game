@@ -13,6 +13,7 @@ using Polytoria.Shared.Misc;
 using Polytoria.Utils;
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace Polytoria.Datamodel;
@@ -81,6 +82,25 @@ public sealed partial class PolytorianModel : CharacterModel
 	private readonly Dictionary<CharacterAttachmentEnum, Dynamic> _attachmentEnumToDyn = [];
 	private PackedScene? _bodyPkScene;
 	private bool _updateClothDirty = false;
+	private VisibleOnScreenNotifier3D? _visibilityNotifier;
+	private bool _isOnScreen = true;
+	private bool _animationOverridden = false;
+	private int _initialVisibilityGraceFrames = 0;
+	private bool _isCountedInTotal = false;
+	private bool _wasAnimActive = false;
+
+	private static int _activeCount = 0;
+	private static int _totalCount = 0;
+
+	public static int ActiveCount => Math.Max(0, _activeCount);
+	public static int TotalCount => Math.Max(0, _totalCount);
+
+	private bool ShouldAllowAnimationCulling =>
+		!Globals.IsHeadless &&
+		!_animationOverridden &&
+		Root != null &&
+		Root.SessionType != World.SessionTypeEnum.Renderer &&
+		Parent != Root.Players?.LocalPlayer;
 
 	public PhysicalBone3D? VelocityPhysicalBone;
 
@@ -275,8 +295,27 @@ public sealed partial class PolytorianModel : CharacterModel
 		LeftLegMeshInstance.MaterialOverride = _leftLegMat;
 		RightLegMeshInstance.MaterialOverride = _rightLegMat;
 
+		ConfigureBodyPartVisibilityRange(HeadMeshInstance);
+		ConfigureBodyPartVisibilityRange(TorsoMeshInstance);
+		ConfigureBodyPartVisibilityRange(LeftArmMeshInstance);
+		ConfigureBodyPartVisibilityRange(RightArmMeshInstance);
+		ConfigureBodyPartVisibilityRange(LeftLegMeshInstance);
+		ConfigureBodyPartVisibilityRange(RightLegMeshInstance);
+
 		AnimTree = GDNode.GetNode<AnimationTree>("AnimationTree");
 		AnimTree.Active = true;
+
+		if (!Globals.IsHeadless)
+		{
+			_visibilityNotifier = new VisibleOnScreenNotifier3D
+			{
+				// Pivot (Character/Poly) has inherited 0.5 scale and (0, -3, 0) foot origin
+				Aabb = new Aabb(new Vector3(-7f, -2f, -7f), new Vector3(14f, 18f, 14f))
+			};
+			_visibilityNotifier.ScreenEntered += OnScreenEntered;
+			_visibilityNotifier.ScreenExited += OnScreenExited;
+			Pivot.AddChild(_visibilityNotifier, false, Node.InternalMode.Back);
+		}
 
 		base.Init();
 		SetProcess(true);
@@ -284,6 +323,24 @@ public sealed partial class PolytorianModel : CharacterModel
 
 	public override void PreDelete()
 	{
+		if (_visibilityNotifier != null && Node.IsInstanceValid(_visibilityNotifier))
+		{
+			_visibilityNotifier.ScreenEntered -= OnScreenEntered;
+			_visibilityNotifier.ScreenExited -= OnScreenExited;
+		}
+		_visibilityNotifier = null;
+
+		if (_wasAnimActive)
+		{
+			_wasAnimActive = false;
+			Interlocked.Decrement(ref _activeCount);
+		}
+		if (_isCountedInTotal)
+		{
+			_isCountedInTotal = false;
+			Interlocked.Decrement(ref _totalCount);
+		}
+
 		// Free helper
 		_helper?.QueueFree();
 
@@ -333,6 +390,17 @@ public sealed partial class PolytorianModel : CharacterModel
 			phy.AddCollisionShape(CollisionShape);
 			phy.UpdateCollision();
 		}
+
+		// Allow one initial frame so initial skeletal pose evaluates before off-screen culling activates
+		_isOnScreen = true;
+		_initialVisibilityGraceFrames = 2;
+		if (!_isCountedInTotal)
+		{
+			_isCountedInTotal = true;
+			Interlocked.Increment(ref _totalCount);
+		}
+		UpdateAnimationActive();
+
 		base.EnterTree();
 	}
 
@@ -349,6 +417,18 @@ public sealed partial class PolytorianModel : CharacterModel
 			CollisionPivot = null;
 			CollisionShape = null;
 		}
+
+		if (_wasAnimActive)
+		{
+			_wasAnimActive = false;
+			Interlocked.Decrement(ref _activeCount);
+		}
+		if (_isCountedInTotal)
+		{
+			_isCountedInTotal = false;
+			Interlocked.Decrement(ref _totalCount);
+		}
+
 		base.ExitTree();
 	}
 
@@ -411,6 +491,21 @@ public sealed partial class PolytorianModel : CharacterModel
 		{
 			_updateClothDirty = false;
 			UpdateClothMaterials();
+		}
+
+		if (_initialVisibilityGraceFrames > 0 && --_initialVisibilityGraceFrames == 0)
+		{
+			_isOnScreen = _visibilityNotifier?.IsOnScreen() ?? true;
+			UpdateAnimationActive();
+		}
+
+		if (!AnimTree.Active)
+		{
+			if (!_animationOverridden && !ShouldAllowAnimationCulling)
+			{
+				UpdateAnimationActive();
+			}
+			if (!AnimTree.Active) return;
 		}
 
 		foreach (KeyValuePair<string, float> kvp in _blendTargets)
@@ -552,6 +647,18 @@ public sealed partial class PolytorianModel : CharacterModel
 	private static void ApplyDefaultBodyPart(MeshInstance3D m3d, string k)
 	{
 		m3d.Mesh = GD.Load<Godot.Mesh>($"res://assets/models/bodyparts/default/{k}.tres");
+	}
+
+	private void ConfigureBodyPartVisibilityRange(MeshInstance3D m3d)
+	{
+		if (Globals.IsHeadless || Root?.SessionType == World.SessionTypeEnum.Renderer)
+		{
+			return;
+		}
+
+		m3d.VisibilityRangeEnd = 300f;
+		m3d.VisibilityRangeEndMargin = 30f;
+		m3d.VisibilityRangeFadeMode = GeometryInstance3D.VisibilityRangeFadeModeEnum.Self;
 	}
 
 	private static void ApplyBodyPart(Node source, MeshInstance3D target, string sourceName)
@@ -919,7 +1026,73 @@ public sealed partial class PolytorianModel : CharacterModel
 
 	public void SetAnimationOverrideTo(bool to)
 	{
-		AnimTree.Active = !to;
+		_animationOverridden = to;
+		UpdateAnimationActive();
+	}
+
+	private void OnScreenEntered()
+	{
+		_isOnScreen = true;
+		UpdateAnimationActive();
+	}
+
+	private void OnScreenExited()
+	{
+		_isOnScreen = false;
+		UpdateAnimationActive();
+	}
+
+	private void UpdateAnimationActive()
+	{
+		if (AnimTree == null || !Node.IsInstanceValid(AnimTree)) return;
+
+		if (_animationOverridden)
+		{
+			SetAnimActive(false);
+			return;
+		}
+
+		bool shouldBeActive = !ShouldAllowAnimationCulling || _isOnScreen;
+		SetAnimActive(shouldBeActive);
+	}
+
+	private void SetAnimActive(bool active)
+	{
+		if (AnimTree.Active != active)
+		{
+			if (active)
+			{
+				ApplyBlendTargetsImmediate();
+				Animator?.OnAnimationResumed();
+			}
+			AnimTree.Active = active;
+		}
+
+		if (_wasAnimActive != active)
+		{
+			_wasAnimActive = active;
+			if (active)
+			{
+				Interlocked.Increment(ref _activeCount);
+			}
+			else
+			{
+				Interlocked.Decrement(ref _activeCount);
+			}
+		}
+	}
+
+	private void ApplyBlendTargetsImmediate()
+	{
+		foreach (KeyValuePair<string, float> kvp in _blendTargets)
+		{
+			if (!_blendParamNames.TryGetValue(kvp.Key, out StringName? paramName))
+			{
+				paramName = kvp.Key;
+				_blendParamNames[kvp.Key] = paramName;
+			}
+			AnimTree.Set(paramName, kvp.Value);
+		}
 	}
 
 	internal struct AvatarLoadResponse()

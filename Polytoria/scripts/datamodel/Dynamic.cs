@@ -1098,7 +1098,7 @@ public partial class Dynamic : Instance
 #if CREATOR
 					if (n is ISpatial) continue;
 #endif
-					if (n is VisualInstance3D v3d)
+					if (n is VisualInstance3D v3d and not VisibleOnScreenNotifier3D)
 					{
 						if (!v3d.IsVisibleInTree())
 						{

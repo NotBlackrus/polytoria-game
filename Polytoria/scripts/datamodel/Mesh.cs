@@ -8,10 +8,12 @@ using Polytoria.Datamodel.Resources;
 using Polytoria.Enums;
 using Polytoria.Networking;
 using Polytoria.Scripting;
+using Polytoria.Shared;
 using Polytoria.Utils;
 using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using System.Threading;
 
 namespace Polytoria.Datamodel;
 
@@ -33,6 +35,23 @@ public sealed partial class Mesh : Entity
 	private Color _color = new(1, 1, 1);
 	private bool _castShadows;
 	private AnimationPlayer? _animPlay;
+	private VisibleOnScreenNotifier3D? _visibilityNotifier;
+	private bool _isOnScreen;
+	private bool _isCulledPaused;
+	private string? _activeAnimName;
+	private float _activeAnimSpeed = 1.0f;
+	private bool _activeAnimLoop;
+	private double _activeAnimStartTime;
+	private double _activeAnimLength;
+	private bool _trackedAsAnimated = false;
+	private bool _trackedAsActive = false;
+
+	private static int _activeMeshAnimCount = 0;
+	private static int _totalMeshAnimCount = 0;
+
+	public static int ActiveAnimationCount => Math.Max(0, _activeMeshAnimCount);
+	public static int TotalAnimatedMeshCount => Math.Max(0, _totalMeshAnimCount);
+
 	private readonly List<MeshInstance3D> _meshInstances = [];
 	private readonly List<SurfaceMaterial> _materials = [];
 	private Resource? _prevResource;
@@ -57,6 +76,7 @@ public sealed partial class Mesh : Entity
 				}
 			}
 			_asset = value;
+			CleanupVisibilityNotifier();
 			if (_meshNode != null && Node.IsInstanceValid(_meshNode))
 			{
 				_meshNode.QueueFree();
@@ -189,6 +209,21 @@ public sealed partial class Mesh : Entity
 		}
 	}
 
+	private float _maxDistance = 0f;
+
+	[Editable, ScriptProperty, DefaultValue(0f)]
+	public float MaxDistance
+	{
+		get => _maxDistance;
+		set
+		{
+			if (Mathf.IsEqualApprox(_maxDistance, value)) return;
+			_maxDistance = value;
+			UpdateVisibilityRange();
+			OnPropertyChanged();
+		}
+	}
+
 	[ScriptProperty]
 	public string? CurrentAnimation
 	{
@@ -196,6 +231,10 @@ public sealed partial class Mesh : Entity
 		{
 			if (_animPlay != null)
 			{
+				if (_isCulledPaused)
+				{
+					return IsActiveAnimStillRunning() ? _activeAnimName : "";
+				}
 				return _animPlay.CurrentAnimation;
 			}
 			return null;
@@ -209,6 +248,10 @@ public sealed partial class Mesh : Entity
 		{
 			if (_animPlay != null)
 			{
+				if (_isCulledPaused)
+				{
+					return IsActiveAnimStillRunning();
+				}
 				return _animPlay.IsPlaying();
 			}
 			return false;
@@ -224,7 +267,9 @@ public sealed partial class Mesh : Entity
 	[SyncVar] public double ServerAnimStart { get; internal set; }
 
 	private double ServerTime => Root?.Network != null ? (double)Root.ServerTime : 0;
+	private double AnimTime => Root?.Network != null ? (double)Root.ServerTime : Time.GetTicksMsec() / 1000.0;
 	private bool CanSyncAnim => Root?.Network != null && (Root.Network.IsServer || (HasAuthority && ExistInNetwork));
+	private bool ShouldAllowAnimationCulling => !Globals.IsHeadless && Root?.SessionType != World.SessionTypeEnum.Renderer;
 
 	[ScriptEnum("MeshCollisionType")]
 	public enum CollisionTypeEnum
@@ -251,6 +296,19 @@ public sealed partial class Mesh : Entity
 		base.Ready();
 	}
 
+	public override void EnterTree()
+	{
+		base.EnterTree();
+		UpdateAnimationTracking();
+		UpdateVisibilityRange();
+	}
+
+	public override void ExitTree()
+	{
+		ClearAnimationTracking();
+		base.ExitTree();
+	}
+
 	public override void InitOverrides()
 	{
 		Size = Vector3.One * 0.5f;
@@ -259,6 +317,7 @@ public sealed partial class Mesh : Entity
 
 	public override void PreDelete()
 	{
+		CleanupVisibilityNotifier();
 		_asset?.PropertyChanged.Disconnect(UpdateColor);
 		_materials.Clear();
 		_meshInstances.Clear();
@@ -294,6 +353,7 @@ public sealed partial class Mesh : Entity
 		if (resource is PackedScene scene)
 		{
 			if (!Node.IsInstanceValid(GDNode)) return;
+			CleanupVisibilityNotifier();
 			_animPlay = null;
 			if (_meshNode != null && Node.IsInstanceValid(_meshNode))
 			{
@@ -345,8 +405,10 @@ public sealed partial class Mesh : Entity
 
 			UpdateColor();
 			UpdateShadows();
+			UpdateVisibilityRange();
 
 			_meshContainer.AddChild(obj);
+			SetupVisibilityNotifier();
 
 			if (ServerAnim != null)
 			{
@@ -383,7 +445,7 @@ public sealed partial class Mesh : Entity
 		}
 		else
 		{
-			InternalPlayAnimation(animationName, speed, loop, ServerTime);
+			InternalPlayAnimation(animationName, speed, loop, AnimTime);
 		}
 	}
 
@@ -402,14 +464,158 @@ public sealed partial class Mesh : Entity
 		if (!_animPlay.HasAnimation(animationName)) { return; }
 		Godot.Animation targetAnim = _animPlay.GetAnimation(animationName);
 		targetAnim.LoopMode = loop ? Godot.Animation.LoopModeEnum.Linear : Godot.Animation.LoopModeEnum.None;
-		_animPlay.Play(animationName, -1, speed);
 
-		double pos = (ServerTime - startTime) * speed;
-		if (loop) pos %= targetAnim.Length;
-		if (pos >= 0 && pos < targetAnim.Length)
+		_activeAnimName = animationName;
+		_activeAnimSpeed = speed;
+		_activeAnimLoop = loop;
+		_activeAnimStartTime = startTime;
+		_activeAnimLength = targetAnim.Length;
+
+		ApplyAnimationPlayback();
+	}
+
+	private void SetupVisibilityNotifier()
+	{
+		if (_meshNode == null || _animPlay == null || Globals.IsHeadless)
+		{
+			return;
+		}
+
+		_animPlay.AnimationFinished -= OnAnimationFinished;
+		_animPlay.AnimationFinished += OnAnimationFinished;
+
+		Aabb meshBounds = _meshNode.CalculateBounds();
+		float margin = Mathf.Max(0.5f, meshBounds.GetLongestAxisSize() * 0.25f);
+		_visibilityNotifier = new VisibleOnScreenNotifier3D
+		{
+			Aabb = meshBounds.Grow(margin)
+		};
+		_visibilityNotifier.ScreenEntered += OnScreenEntered;
+		_visibilityNotifier.ScreenExited += OnScreenExited;
+		_meshNode.AddChild(_visibilityNotifier, false, Node.InternalMode.Back);
+		_isOnScreen = _visibilityNotifier.IsOnScreen();
+	}
+
+	private void CleanupVisibilityNotifier()
+	{
+		if (_animPlay != null && Node.IsInstanceValid(_animPlay))
+		{
+			_animPlay.AnimationFinished -= OnAnimationFinished;
+		}
+		if (_visibilityNotifier != null)
+		{
+			if (Node.IsInstanceValid(_visibilityNotifier))
+			{
+				_visibilityNotifier.ScreenEntered -= OnScreenEntered;
+				_visibilityNotifier.ScreenExited -= OnScreenExited;
+				_visibilityNotifier.QueueFree();
+			}
+			_visibilityNotifier = null;
+		}
+		_isOnScreen = false;
+		_isCulledPaused = false;
+		_activeAnimName = null;
+		ClearAnimationTracking();
+	}
+
+	private void OnScreenEntered()
+	{
+		_isOnScreen = true;
+		if (_isCulledPaused && _activeAnimName != null)
+		{
+			ApplyAnimationPlayback();
+		}
+		UpdateAnimationTracking();
+	}
+
+	private void OnScreenExited()
+	{
+		_isOnScreen = false;
+		if (_animPlay == null)
+		{
+			UpdateAnimationTracking();
+			return;
+		}
+
+		if (!_animPlay.IsPlaying())
+		{
+			if (!_isCulledPaused)
+			{
+				_activeAnimName = null;
+			}
+			UpdateAnimationTracking();
+			return;
+		}
+
+		if (ShouldAllowAnimationCulling)
+		{
+			_animPlay.Pause();
+			_isCulledPaused = true;
+		}
+		UpdateAnimationTracking();
+	}
+
+	private bool IsActiveAnimStillRunning()
+	{
+		if (_activeAnimName == null || _animPlay == null)
+		{
+			return false;
+		}
+		if (_activeAnimLoop || _activeAnimSpeed == 0f)
+		{
+			return true;
+		}
+		double elapsed = Math.Max(0.0, AnimTime - _activeAnimStartTime);
+		return elapsed * Math.Abs((double)_activeAnimSpeed) < _activeAnimLength;
+	}
+
+	private void ApplyAnimationPlayback()
+	{
+		if (_animPlay == null || _activeAnimName == null || !_animPlay.HasAnimation(_activeAnimName))
+		{
+			return;
+		}
+
+		double length = _activeAnimLength;
+		float speed = _activeAnimSpeed;
+		bool loop = _activeAnimLoop;
+		double elapsed = Math.Max(0.0, AnimTime - _activeAnimStartTime);
+		double absDist = elapsed * Math.Abs((double)speed);
+
+		_isCulledPaused = false;
+
+		if (!loop && speed != 0f && absDist >= length)
+		{
+			double endPos = speed > 0f ? length : 0.0;
+			_animPlay.Play(_activeAnimName, -1, speed);
+			_animPlay.Seek(endPos, true);
+			_animPlay.Stop(true);
+			_activeAnimName = null;
+			UpdateAnimationTracking();
+			return;
+		}
+
+		double pos = 0.0;
+		if (length > 0.0)
+		{
+			double rem = loop ? (absDist % length) : Math.Min(absDist, length);
+			pos = speed >= 0f ? rem : (length - rem);
+		}
+
+		bool shouldCull = ShouldAllowAnimationCulling && _visibilityNotifier != null && !_isOnScreen;
+
+		_animPlay.Play(_activeAnimName, -1, speed);
+		if (pos >= 0.0 && pos <= length)
 		{
 			_animPlay.Seek(pos, true);
 		}
+
+		if (shouldCull)
+		{
+			_animPlay.Pause();
+			_isCulledPaused = true;
+		}
+		UpdateAnimationTracking();
 	}
 
 	[ScriptLegacyMethod("PlayAnimation")]
@@ -441,9 +647,70 @@ public sealed partial class Mesh : Entity
 	private void InternalStopAnimation(string? animationName)
 	{
 		if (_animPlay == null) { return; }
-		if (string.IsNullOrEmpty(animationName) || _animPlay.CurrentAnimation == animationName)
+		string? current = CurrentAnimation;
+		if (string.IsNullOrEmpty(animationName) || current == animationName || _activeAnimName == animationName)
 		{
+			_activeAnimName = null;
+			_isCulledPaused = false;
 			_animPlay.Stop(true);
+			UpdateAnimationTracking();
+		}
+	}
+
+	private void OnAnimationFinished(StringName animName)
+	{
+		if (_activeAnimName != null && animName == (StringName)_activeAnimName && !_activeAnimLoop)
+		{
+			_activeAnimName = null;
+			_isCulledPaused = false;
+			UpdateAnimationTracking();
+		}
+	}
+
+	private void UpdateAnimationTracking()
+	{
+		bool isAnimated = _animPlay != null && ((_activeAnimName != null && IsActiveAnimStillRunning()) || _animPlay.IsPlaying() || _isCulledPaused);
+		bool isActive = _animPlay != null && _animPlay.IsPlaying() && !_isCulledPaused && (GDNode?.IsInsideTree() ?? false);
+
+		if (_trackedAsAnimated != isAnimated)
+		{
+			_trackedAsAnimated = isAnimated;
+			if (isAnimated)
+			{
+				Interlocked.Increment(ref _totalMeshAnimCount);
+			}
+			else
+			{
+				Interlocked.Decrement(ref _totalMeshAnimCount);
+			}
+		}
+
+		if (_trackedAsActive != isActive)
+		{
+			_trackedAsActive = isActive;
+			if (isActive)
+			{
+				Interlocked.Increment(ref _activeMeshAnimCount);
+			}
+			else
+			{
+				Interlocked.Decrement(ref _activeMeshAnimCount);
+			}
+		}
+	}
+
+	private void ClearAnimationTracking()
+	{
+		if (_trackedAsAnimated)
+		{
+			_trackedAsAnimated = false;
+			Interlocked.Decrement(ref _totalMeshAnimCount);
+		}
+
+		if (_trackedAsActive)
+		{
+			_trackedAsActive = false;
+			Interlocked.Decrement(ref _activeMeshAnimCount);
 		}
 	}
 
@@ -459,6 +726,7 @@ public sealed partial class Mesh : Entity
 	{
 		if (_animPlay == null) { return []; }
 		List<MeshAnimationInfo> animInfo = [];
+		string? currentAnim = CurrentAnimation;
 
 		foreach (string animKey in _animPlay.GetAnimationList())
 		{
@@ -467,7 +735,7 @@ public sealed partial class Mesh : Entity
 			{
 				Name = animKey,
 				Length = anim.Length,
-				IsPlaying = _animPlay.CurrentAnimation == animKey
+				IsPlaying = currentAnim == animKey
 			});
 		}
 
@@ -689,6 +957,78 @@ public sealed partial class Mesh : Entity
 	internal override void OnNodeSizeChanged(Vector3 newSize)
 	{
 		_meshContainer.Scale = newSize;
+		UpdateVisibilityRange();
+	}
+
+	private void UpdateVisibilityRange()
+	{
+		if (Globals.IsHeadless || Root?.SessionType == World.SessionTypeEnum.Renderer)
+		{
+			return;
+		}
+
+		float rangeEnd;
+		float rangeMargin;
+		GeometryInstance3D.VisibilityRangeFadeModeEnum fadeMode;
+
+		if (_maxDistance > 0f)
+		{
+			// Explicit creator override
+			rangeEnd = _maxDistance;
+			rangeMargin = Math.Min(_maxDistance * 0.15f, 30f);
+			fadeMode = GeometryInstance3D.VisibilityRangeFadeModeEnum.Self;
+		}
+		else if (_maxDistance < 0f)
+		{
+			// Forced infinite draw distance
+			rangeEnd = 0f;
+			rangeMargin = 0f;
+			fadeMode = GeometryInstance3D.VisibilityRangeFadeModeEnum.Disabled;
+		}
+		else
+		{
+			// Automatic heuristic based on parentage and size
+			bool isAccessoryOrTool = Parent is Accessory || IsDescendantOfClass<Accessory>() || Parent is Tool || IsDescendantOfClass<Tool>();
+
+			if (isAccessoryOrTool)
+			{
+				rangeEnd = 80f;
+				rangeMargin = 10f;
+				fadeMode = GeometryInstance3D.VisibilityRangeFadeModeEnum.Self;
+			}
+			else
+			{
+				float maxDim = Math.Max(Size.X, Math.Max(Size.Y, Size.Z));
+				if (maxDim < 1.0f)
+				{
+					// Micro / Small props (coins, bottles, debris)
+					rangeEnd = 120f;
+					rangeMargin = 15f;
+					fadeMode = GeometryInstance3D.VisibilityRangeFadeModeEnum.Self;
+				}
+				else if (maxDim < 3.5f)
+				{
+					// Medium props (crates, furniture, small vehicles)
+					rangeEnd = 250f;
+					rangeMargin = 25f;
+					fadeMode = GeometryInstance3D.VisibilityRangeFadeModeEnum.Self;
+				}
+				else
+				{
+					// Large structures, terrain chunks, buildings: no distance cutoff
+					rangeEnd = 0f;
+					rangeMargin = 0f;
+					fadeMode = GeometryInstance3D.VisibilityRangeFadeModeEnum.Disabled;
+				}
+			}
+		}
+
+		foreach (MeshInstance3D m3d in _meshInstances)
+		{
+			m3d.VisibilityRangeEnd = rangeEnd;
+			m3d.VisibilityRangeEndMargin = rangeMargin;
+			m3d.VisibilityRangeFadeMode = fadeMode;
+		}
 	}
 
 	public struct MeshAnimationInfo : IScriptObject

@@ -35,10 +35,12 @@ public partial class Animator : Instance
 
 	private string? _currentOneShot;
 	private string? _pendingOneShot;
+	private double _oneShotExpireTime;
 
 	private string _currentAnimation = "";
 	private bool _queuePostAnimationImport = false;
 	private readonly HashSet<string> _impluseOneShots = [];
+	private readonly Dictionary<string, double> _oneShotLengths = [];
 	private int _customAnimCounter = 0;
 
 	public float BlendSpeed = 10f;
@@ -119,6 +121,7 @@ public partial class Animator : Instance
 		// }
 
 		AnimationList.Clear();
+		_oneShotLengths.Clear();
 		base.PreDelete();
 	}
 
@@ -212,7 +215,7 @@ public partial class Animator : Instance
 		base.Process(delta);
 		if (_dynBlend == null || AnimationTree == null)
 			return;
-		if (!Node.IsInstanceValid(AnimationTree)) return;
+		if (!Node.IsInstanceValid(AnimationTree) || !AnimationTree.Active) return;
 
 		// Smooth step toward target
 		float currentValue = (float)AnimationTree.Get(DynBlendPath);
@@ -415,6 +418,7 @@ public partial class Animator : Instance
 		targetTree.ConnectNode("output", 0, oneshotKey);
 
 		Godot.Animation anim = AnimationTree.GetAnimation(animationName);
+		_oneShotLengths[animationKey] = anim.Length;
 		animationOneShot.FilterEnabled = true;
 
 		// Filter only nodes that have at least one track with more than 1 key
@@ -541,6 +545,7 @@ public partial class Animator : Instance
 		AnimationTree.Set(oneshotPath + "/request", (int)AnimationNodeOneShot.OneShotRequest.Fire);
 
 		_pendingOneShot = oneshotPath;
+		_oneShotExpireTime = (Time.GetTicksMsec() / 1000.0) + _oneShotLengths.GetValueOrDefault(animationKey, 1.0);
 	}
 
 	[ScriptMethod]
@@ -589,10 +594,45 @@ public partial class Animator : Instance
 
 	private void AbortCurrentOneShot()
 	{
+		if (_pendingOneShot != null)
+		{
+			ClearOneShotState(_pendingOneShot);
+			_pendingOneShot = null;
+		}
 		if (_currentOneShot != null)
 		{
 			AnimationTree.Set(_currentOneShot + "/request", (int)AnimationNodeOneShot.OneShotRequest.Abort);
 			_currentOneShot = null;
+		}
+	}
+
+	private void ClearOneShotState(string oneshotPath)
+	{
+		bool isActive = (bool)AnimationTree.Get(oneshotPath + "/active");
+		AnimationTree.Set(
+			oneshotPath + "/request",
+			(int)(isActive ? AnimationNodeOneShot.OneShotRequest.Abort : AnimationNodeOneShot.OneShotRequest.None)
+		);
+	}
+
+	internal void OnAnimationResumed()
+	{
+		if (AnimationTree == null || !Node.IsInstanceValid(AnimationTree)) return;
+
+		double now = Time.GetTicksMsec() / 1000.0;
+		if ((_pendingOneShot != null || _currentOneShot != null) && now >= _oneShotExpireTime)
+		{
+			AbortCurrentOneShot();
+			if (string.IsNullOrEmpty(_currentAnimation))
+			{
+				_dynPlayback?.Start("End");
+				_targetDynBlendValue = 0f;
+			}
+		}
+
+		if (_dynBlend != null)
+		{
+			AnimationTree.Set(DynBlendPath, _targetDynBlendValue);
 		}
 	}
 
